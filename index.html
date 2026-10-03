@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSON Viewer</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #12141a;
+    --panel: #171a22;
+    --line: #262a35;
+    --text: #c9d1e0;
+    --dim: #6b7488;
+    --key: #7cb7ff;
+    --str: #a5d68a;
+    --num: #f2b66d;
+    --bool: #d09cf5;
+    --null: #ef7f8e;
+    --err: #ef7f8e;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.6 var(--mono);
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 16px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: .02em; }
+  #status { color: var(--dim); font-size: 12px; flex: 1; min-width: 120px; }
+  #status.err { color: var(--err); }
+  #status.ok { color: var(--str); }
+  .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  button {
+    font: inherit; font-size: 12px;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 10px; cursor: pointer;
+  }
+  button:hover { border-color: var(--dim); }
+  button[aria-pressed="true"] { border-color: var(--key); color: var(--key); }
+  button:focus-visible, textarea:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--key); outline-offset: 1px;
+  }
+
+  main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); }
+  main.editing { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
+  textarea { display: none; }
+  main.editing textarea {
+    display: block;
+    resize: none; border: 0; border-right: 1px solid var(--line);
+    background: var(--panel); color: var(--text);
+    font: inherit; font-size: 13px; padding: 14px 16px;
+    white-space: pre; overflow: auto; tab-size: 2;
+  }
+  textarea::placeholder { color: var(--dim); }
+  #output { overflow: auto; padding: 14px 16px 40px; }
+  .empty { color: var(--dim); }
+  kbd {
+    font: inherit; font-size: 12px; color: var(--text);
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 6px;
+  }
+
+  /* tree */
+  details, .row { margin: 0; }
+  summary { cursor: pointer; list-style: none; border-radius: 4px; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before {
+    content: "▸"; display: inline-block; width: 1.1em; margin-left: -1.1em;
+    color: var(--dim); transition: transform .12s;
+  }
+  details[open] > summary::before { transform: rotate(90deg); }
+  summary:hover { background: rgba(255,255,255,.04); }
+  .kids { margin-left: .6em; padding-left: 1.1em; border-left: 1px solid var(--line); }
+  .root { padding-left: 1.1em; }
+  details[open] > summary .peek { display: none; }
+  details:not([open]) > .close { display: none; }
+  .peek { color: var(--dim); font-size: 12px; }
+  .k { color: var(--key); }
+  .s { color: var(--str); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .n { color: var(--num); }
+  .b { color: var(--bool); }
+  .z { color: var(--null); }
+  .p { color: var(--dim); }
+
+  @media (max-width: 720px) {
+    main.editing { grid-template-columns: 1fr; grid-template-rows: 35% 1fr; }
+    main.editing textarea { border-right: 0; border-bottom: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>JSON Viewer</h1>
+    <div id="status">Ready</div>
+    <div class="actions">
+      <button id="paste" type="button">Paste</button>
+      <button id="expand" type="button">Expand all</button>
+      <button id="collapse" type="button">Collapse all</button>
+      <button id="edit" type="button" aria-pressed="false">Edit input</button>
+      <button id="format" type="button">Format input</button>
+      <button id="copy" type="button">Copy formatted</button>
+      <button id="clear" type="button">Clear</button>
+    </div>
+  </header>
+  <main id="main">
+    <textarea id="input" spellcheck="false" placeholder="Paste JSON here"></textarea>
+    <div id="output"></div>
+  </main>
+
+<script>
+  const main = document.getElementById('main');
+  const input = document.getElementById('input');
+  const out = document.getElementById('output');
+  const status = document.getElementById('status');
+  const editBtn = document.getElementById('edit');
+  let data;
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  // Parses JSON; also unwraps JSON that was pasted as an escaped string
+  // (common when copying a cell from a database UI).
+  function parse(text) {
+    let v = JSON.parse(text);
+    for (let i = 0; i < 2 && typeof v === 'string'; i++) {
+      try { v = JSON.parse(v); } catch { break; }
+    }
+    return v;
+  }
+
+  function primitive(val) {
+    if (val === null) return el('span', 'z', 'null');
+    if (typeof val === 'string') return el('span', 's', JSON.stringify(val));
+    if (typeof val === 'number') return el('span', 'n', String(val));
+    return el('span', 'b', String(val));
+  }
+
+  function label(key) {
+    const frag = document.createDocumentFragment();
+    if (key !== null) {
+      frag.append(el('span', 'k', typeof key === 'number' ? String(key) : JSON.stringify(key)), el('span', 'p', ': '));
+    }
+    return frag;
+  }
+
+  function node(key, val, depth, last) {
+    const comma = last ? '' : ',';
+    const isArr = Array.isArray(val);
+    const isObj = val !== null && typeof val === 'object';
+
+    if (!isObj || Object.keys(val).length === 0) {
+      const row = el('div', 'row');
+      row.append(label(key));
+      row.append(isObj ? el('span', 'p', isArr ? '[]' : '{}') : primitive(val));
+      if (comma) row.append(el('span', 'p', comma));
+      return row;
+    }
+
+    const [open, close] = isArr ? ['[', ']'] : ['{', '}'];
+    const entries = isArr ? val.map((v, i) => [i, v]) : Object.entries(val);
+    const count = entries.length;
+
+    const d = el('details');
+    d.open = depth < 3;
+
+    const sum = el('summary');
+    sum.append(label(key), el('span', 'p', open));
+    const peek = el('span', 'peek', ` ${count} ${isArr ? (count === 1 ? 'item' : 'items') : (count === 1 ? 'key' : 'keys')} `);
+    sum.append(peek, el('span', 'p peek', close + comma));
+    d.append(sum);
+
+    const kids = el('div', 'kids');
+    entries.forEach(([k, v], i) => kids.append(node(isArr ? null : k, v, depth + 1, i === count - 1)));
+    d.append(kids);
+
+    d.append(el('div', 'close p', close + comma));
+    return d;
+  }
+
+  function setStatus(msg, cls) {
+    status.textContent = msg;
+    status.className = cls || '';
+  }
+
+  function setEditing(on) {
+    main.classList.toggle('editing', on);
+    editBtn.setAttribute('aria-pressed', String(on));
+    if (on) input.focus();
+  }
+
+  function emptyState() {
+    const box = el('div', 'empty');
+    box.append('Press ');
+    box.append(el('kbd', '', 'Ctrl'), ' / ', el('kbd', '', '⌘'), ' + ', el('kbd', '', 'V'));
+    box.append(' anywhere on this page to view JSON from your clipboard.');
+    return box;
+  }
+
+  function render() {
+    const text = input.value.trim();
+    out.replaceChildren();
+    data = undefined;
+    if (!text) {
+      out.append(emptyState());
+      setStatus('Ready');
+      return;
+    }
+    try {
+      data = parse(text);
+      const root = el('div', 'root');
+      root.append(node(null, data, 0, true));
+      out.append(root);
+      setStatus('Valid JSON', 'ok');
+    } catch (e) {
+      out.append(el('div', 'empty', 'Not valid JSON. Fix it in the input pane.'));
+      setStatus(e.message, 'err');
+      setEditing(true);
+    }
+  }
+
+  function load(text) {
+    input.value = text;
+    render();
+  }
+
+  const setAll = (state) => out.querySelectorAll('details').forEach(d => d.open = state);
+
+  // Paste anywhere on the page (except inside the editor, which handles its own input)
+  document.addEventListener('paste', (e) => {
+    if (e.target === input) return;
+    const text = e.clipboardData && e.clipboardData.getData('text');
+    if (!text) return;
+    e.preventDefault();
+    load(text);
+  });
+
+  input.addEventListener('input', render);
+
+  document.getElementById('paste').onclick = async () => {
+    try {
+      load(await navigator.clipboard.readText());
+    } catch {
+      setStatus('Clipboard access blocked. Use Ctrl/Cmd+V instead', 'err');
+    }
+  };
+  document.getElementById('expand').onclick = () => setAll(true);
+  document.getElementById('collapse').onclick = () => setAll(false);
+  editBtn.onclick = () => setEditing(!main.classList.contains('editing'));
+  document.getElementById('format').onclick = () => {
+    if (data !== undefined) load(JSON.stringify(data, null, 2));
+  };
+  document.getElementById('copy').onclick = async (e) => {
+    if (data === undefined) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(data, null, 2));
+      const b = e.currentTarget, t = b.textContent;
+      b.textContent = 'Copied';
+      setTimeout(() => b.textContent = t, 1200);
+    } catch { setStatus('Copy blocked by the browser', 'err'); }
+  };
+  document.getElementById('clear').onclick = () => { load(''); setEditing(false); };
+
+  render();
+</script>
+</body>
+</html>
